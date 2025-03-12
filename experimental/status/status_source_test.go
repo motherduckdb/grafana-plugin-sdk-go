@@ -2,9 +2,11 @@ package status_test
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -108,6 +110,47 @@ func TestIsDownstreamError(t *testing.T) {
 	}
 }
 
+func TestIsPluginError(t *testing.T) {
+	tcs := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "nil",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "plugin error",
+			err:      backend.NewErrorWithSource(nil, backend.ErrorSourcePlugin),
+			expected: true,
+		},
+		{
+			name:     "downstream error",
+			err:      backend.NewErrorWithSource(nil, backend.ErrorSourceDownstream),
+			expected: false,
+		},
+		{
+			name:     "other error",
+			err:      fmt.Errorf("other error"),
+			expected: false,
+		},
+		{
+			name:     "network error",
+			err:      newFakeNetworkError(true, true),
+			expected: false,
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			wrappedErr := fmt.Errorf("error: %w", tc.err)
+			assert.Equalf(t, tc.expected, status.IsPluginError(tc.err), "IsPluginError(%v)", tc.err)
+			assert.Equalf(t, tc.expected, status.IsPluginError(wrappedErr), "wrapped IsPluginError(%v)", wrappedErr)
+		})
+	}
+}
+
 func TestIsDownstreamHTTPError(t *testing.T) {
 	tcs := []struct {
 		name       string
@@ -183,13 +226,23 @@ func TestIsDownstreamHTTPError(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "host unreachable error",
+			err:      &net.OpError{Err: &os.SyscallError{Err: syscall.EHOSTUNREACH}},
+			expected: true,
+		},
+		{
+			name:     "network unreachable error",
+			err:      &net.OpError{Err: &os.SyscallError{Err: syscall.ENETUNREACH}},
+			expected: true,
+		},
+		{
 			name:     "DNS not found error",
 			err:      &net.DNSError{IsNotFound: true},
 			expected: true,
 		},
 		{
 			name:     "wrapped *url.Error with UnknownAuthorityError",
-			err:      &url.Error{Op: "Get", URL: "https://example.com", Err: x509.UnknownAuthorityError{}},
+			err:      &url.Error{Op: "Get", URL: "https://example.com", Err: &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}},
 			expected: true,
 		},
 		{
@@ -199,12 +252,69 @@ func TestIsDownstreamHTTPError(t *testing.T) {
 		},
 		{
 			name:     "direct CertificateInvalidError",
-			err:      &x509.CertificateInvalidError{Reason: x509.Expired, Cert: nil},
+			err:      x509.CertificateInvalidError{Reason: x509.Expired, Cert: nil},
 			expected: true,
 		},
 		{
 			name:     "direct UnknownAuthorityError",
 			err:      x509.UnknownAuthorityError{},
+			expected: true,
+		},
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "io.EOF error",
+			err:      io.EOF,
+			expected: false,
+		},
+		{
+			name:     "url io.EOF error",
+			err:      &url.Error{Op: "Get", URL: "https://example.com", Err: io.EOF},
+			expected: true,
+		},
+		{
+			name:     "net op io.EOF error",
+			err:      &net.OpError{Err: io.EOF},
+			expected: true,
+		},
+		{
+			name:     "wrapped url io.EOF error",
+			err:      fmt.Errorf("wrapped: %w", &url.Error{Op: "Get", URL: "https://example.com", Err: io.EOF}),
+			expected: true,
+		},
+		{
+			name:     "joined error with io.EOF",
+			err:      errors.Join(io.EOF, &url.Error{Op: "Get", URL: "https://example.com", Err: io.EOF}),
+			expected: true,
+		},
+		{
+			name: "TLS hostname verification error",
+			err: &url.Error{
+				Op:  "Get",
+				URL: "https://example.com",
+				Err: &tls.CertificateVerificationError{
+					Err: x509.HostnameError{
+						Host:        "example.com",
+						Certificate: &x509.Certificate{},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "TLS certificate expired",
+			err: &url.Error{
+				Op:  "Get",
+				URL: "https://example.com",
+				Err: &tls.CertificateVerificationError{
+					Err: x509.CertificateInvalidError{
+						Reason: x509.Expired,
+					},
+				},
+			},
 			expected: true,
 		},
 	}
